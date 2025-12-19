@@ -9,40 +9,34 @@ import random
 # CONSTANTS
 # ==============================
 
-KM_LIMIT = 120.0                # Standard driver max KM
-MAX_HOURS = 12.0                # Standard driver max shift length
-MAX_ZONE_DEPTH = 2              # Max zone hops allowed
+KM_LIMIT = 120.0
+MAX_HOURS = 12.0
+MAX_ZONE_DEPTH = 2
 
-# Normal (good weather) gaps for regular drivers
-NORMAL_GAP = {0: 10, 1: 15, 2: 20}   # distance → fixed minutes
+NORMAL_GAP = {0: 10, 1: 15, 2: 20}
 
-# Snow mode gaps (randomized) for regular drivers
 SNOW_GAP_RANGES = {
     0: (10, 15),
     1: (15, 20),
     2: (20, 25)
 }
 
-# Special drivers gaps (randomized, longer)
 SPECIAL_GAP_RANGES = {
     0: (10, 20),
     1: (20, 30),
     2: (30, 40)
 }
 
-# Zones that trigger snow rules for regular drivers
 SNOW_ZONES = {1, 2, 3, 4, 5, 6, 8, 10, 11, 13, 17, 30, 32, 34}
 
 # ==============================
-# HELPER FUNCTIONS
+# HELPERS
 # ==============================
 
 def parse_time_str(s: str) -> datetime:
-    """Convert HH:MM:SS string to datetime (date part is dummy)"""
     return datetime.strptime(str(s).strip(), "%H:%M:%S")
 
 def safe_read(file):
-    """Reset uploaded file pointer and return BytesIO"""
     file.seek(0)
     return BytesIO(file.read())
 
@@ -72,7 +66,7 @@ def load_zone_graph(uploaded_file) -> dict:
             if part.isdigit():
                 b = int(part)
                 neighbors[p].add(b)
-                neighbors[b].add(p)  # symmetric
+                neighbors[b].add(p)
     return dict(neighbors)
 
 def load_special_drivers(uploaded_file) -> list:
@@ -90,7 +84,6 @@ def load_special_drivers(uploaded_file) -> list:
         if not time_str:
             continue
 
-        # Handle time window like "14:00 to 19:00"
         if 'to' in time_str.lower():
             parts = time_str.split(' to ')
             if len(parts) != 2:
@@ -106,7 +99,6 @@ def load_special_drivers(uploaded_file) -> list:
             except ValueError:
                 continue
         else:
-            # Single start time (12:00 PM or 14:30)
             try:
                 start_time = datetime.strptime(time_str, "%H:%M").time()
             except ValueError:
@@ -114,24 +106,23 @@ def load_special_drivers(uploaded_file) -> list:
                     start_time = datetime.strptime(time_str, "%I:%M %p").time()
                 except ValueError:
                     continue
-            max_h = MAX_HOURS  # default full shift
+            max_h = MAX_HOURS
 
-        # Parse zones
         zones_str = str(row.get('Zones', '')).strip().strip('"')
-        zones = set()
+        start_zones = set()
         if zones_str:
             try:
-                zones = {int(z.strip()) for z in zones_str.split(',') if z.strip().isdigit()}
+                start_zones = {int(z.strip()) for z in zones_str.split(',') if z.strip().isdigit()}
             except ValueError:
-                zones = set()
+                start_zones = set()
 
         special.append({
             'name': name,
             'km_limit': km_limit,
             'start_time': start_time,
             'max_hours': max_h,
-            'zones': zones,
-            'start_dt': datetime.combine(datetime.min, start_time)  # for sorting
+            'start_zones': start_zones,  # renamed for clarity
+            'start_dt': datetime.combine(datetime.min, start_time)
         })
 
     special.sort(key=lambda d: d['start_dt'])
@@ -158,43 +149,41 @@ def zone_distance(neighbors: dict, start: int, target: int, max_depth: int = 2):
     return None
 
 # ==============================
-# SCHEDULING ALGORITHM
+# SCHEDULING
 # ==============================
 
 def build_schedules(trips: pd.DataFrame, neighbors: dict, snow_mode: bool, special_drivers: list) -> list:
     UNASSIGNED = set(trips.index)
     schedules = []
 
-    # 1. Process special drivers first
+    # Special drivers first
     for driver in special_drivers:
-        eligible = [
+        # First trip MUST start in one of their allowed start zones
+        eligible_first = [
             i for i in UNASSIGNED
             if trips.loc[i, 'pickup_dt'].time() >= driver['start_time']
-            and int(trips.loc[i, 'First Pickup Zone']) in driver['zones']
+            and int(trips.loc[i, 'First Pickup Zone']) in driver['start_zones']
         ]
-        if not eligible:
+        if not eligible_first:
             continue
 
-        eligible.sort(key=lambda i: trips.loc[i, 'pickup_dt'])
-        current_indices = []
-        total_km = 0.0
-        idx = eligible[0]
+        eligible_first.sort(key=lambda i: trips.loc[i, 'pickup_dt'])
+        idx = eligible_first[0]
+        current_indices = [idx]
+        UNASSIGNED.remove(idx)
+        total_km = float(trips.loc[idx, 'KM'])
         first_pickup = trips.loc[idx, 'pickup_dt']
 
+        # Now chain normally — any zone allowed as long as distance ≤2
         while True:
-            current_indices.append(idx)
-            UNASSIGNED.remove(idx)
-            total_km += float(trips.loc[idx, 'KM'])
-            eligible = [e for e in eligible if e != idx]
-
             if total_km >= driver['km_limit'] - 1e-6:
                 break
 
-            prev_drop_time = trips.loc[idx, 'drop_dt']
-            prev_drop_zone = int(trips.loc[idx, 'Last Dropoff Zone'])
+            prev_drop_time = trips.loc[current_indices[-1], 'drop_dt']
+            prev_drop_zone = int(trips.loc[current_indices[-1], 'Last Dropoff Zone'])
             candidates = []
 
-            for i in eligible:
+            for i in UNASSIGNED:
                 pick_zone = int(trips.loc[i, 'First Pickup Zone'])
                 dist = zone_distance(neighbors, prev_drop_zone, pick_zone)
                 if dist is None or dist > MAX_ZONE_DEPTH:
@@ -216,9 +205,12 @@ def build_schedules(trips: pd.DataFrame, neighbors: dict, snow_mode: bool, speci
             if not candidates:
                 break
             candidates.sort(key=lambda x: x[1])
-            idx = candidates[0][0]
+            next_idx = candidates[0][0]
+            current_indices.append(next_idx)
+            UNASSIGNED.remove(next_idx)
+            total_km += float(trips.loc[next_idx, 'KM'])
 
-        if current_indices:
+        if len(current_indices) >= 1:  # at least the first trip
             schedules.append({
                 "id": f"SPECIAL-{driver['name']}",
                 "trip_indices": current_indices,
@@ -226,24 +218,21 @@ def build_schedules(trips: pd.DataFrame, neighbors: dict, snow_mode: bool, speci
                 "is_special": True
             })
 
-    # 2. Remaining trips → regular drivers
+    # Regular drivers on remaining trips
     counter = 1
     while UNASSIGNED:
         idx = min(UNASSIGNED, key=lambda i: trips.loc[i, "pickup_dt"])
-        current_indices = []
-        total_km = 0.0
+        current_indices = [idx]
+        UNASSIGNED.remove(idx)
+        total_km = float(trips.loc[idx, "KM"])
         first_pickup = trips.loc[idx, "pickup_dt"]
 
         while True:
-            current_indices.append(idx)
-            UNASSIGNED.remove(idx)
-            total_km += float(trips.loc[idx, "KM"])
-
             if total_km >= KM_LIMIT - 1e-6:
                 break
 
-            prev_drop_time = trips.loc[idx, "drop_dt"]
-            prev_drop_zone = int(trips.loc[idx, "Last Dropoff Zone"])
+            prev_drop_time = trips.loc[current_indices[-1], "drop_dt"]
+            prev_drop_zone = int(trips.loc[current_indices[-1], "Last Dropoff Zone"])
             candidates = []
 
             for i in UNASSIGNED:
@@ -252,26 +241,28 @@ def build_schedules(trips: pd.DataFrame, neighbors: dict, snow_mode: bool, speci
                 if dist is None or dist > MAX_ZONE_DEPTH:
                     continue
 
-                # Gap logic for regular drivers
                 snow_affected = snow_mode and (prev_drop_zone in SNOW_ZONES or pick_zone in SNOW_ZONES)
                 min_gap = random.randint(*SNOW_GAP_RANGES[dist]) if snow_affected else NORMAL_GAP[dist]
 
-                if trips.loc[i, 'pickup_dt'] < prev_drop_time + timedelta(minutes=min_gap):
+                if trips.loc[i, "pickup_dt"] < prev_drop_time + timedelta(minutes=min_gap):
                     continue
 
-                duration_h = (trips.loc[i, 'drop_dt'] - first_pickup).total_seconds() / 3600
+                duration_h = (trips.loc[i, "drop_dt"] - first_pickup).total_seconds() / 3600
                 if duration_h > MAX_HOURS + 1e-6:
                     continue
 
-                if total_km + float(trips.loc[i, 'KM']) > KM_LIMIT + 1e-6:
+                if total_km + float(trips.loc[i, "KM"]) > KM_LIMIT + 1e-6:
                     continue
 
-                candidates.append((i, trips.loc[i, 'pickup_dt']))
+                candidates.append((i, trips.loc[i, "pickup_dt"]))
 
             if not candidates:
                 break
             candidates.sort(key=lambda x: x[1])
-            idx = candidates[0][0]
+            next_idx = candidates[0][0]
+            current_indices.append(next_idx)
+            UNASSIGNED.remove(next_idx)
+            total_km += float(trips.loc[next_idx, "KM"])
 
         schedules.append({
             "id": f"SCH-{counter:03d}",
@@ -284,7 +275,7 @@ def build_schedules(trips: pd.DataFrame, neighbors: dict, snow_mode: bool, speci
     return schedules
 
 # ==============================
-# OUTPUT TABLES
+# OUTPUT TABLES (unchanged except minor clarity)
 # ==============================
 
 def build_summary(trips: pd.DataFrame, schedules: list) -> pd.DataFrame:
@@ -317,7 +308,7 @@ def build_details(trips: pd.DataFrame, schedules: list, neighbors: dict, snow_mo
             cum_km += float(row["KM"])
 
             if order == 1:
-                justification = "First trip in schedule (priority/earliest eligible)."
+                justification = "First trip (must start in driver's allowed zones)."
             else:
                 prev_idx = idxs[order-2]
                 prev_row = trips.loc[prev_idx]
@@ -353,19 +344,17 @@ def build_details(trips: pd.DataFrame, schedules: list, neighbors: dict, snow_mo
     return pd.DataFrame(rows)
 
 # ==============================
-# STREAMLIT UI
+# STREAMLIT UI (unchanged except small note)
 # ==============================
 
 st.title("Driver Schedule Builder V3 – Special Driver Priority")
 
-# Sidebar
 snow_mode = st.sidebar.checkbox("Snow Mode Active (for general drivers)", value=True)
 if snow_mode:
     st.sidebar.success("Snow gaps active in northern zones")
 else:
     st.sidebar.info("Normal gaps: 10 min (dist 0) • 15 min (dist 1) • 20 min (dist 2)")
 
-# Zone graph (cached)
 if "neighbors" not in st.session_state:
     st.session_state.neighbors = None
 
@@ -381,13 +370,13 @@ else:
         st.session_state.neighbors = None
         st.rerun()
 
-# Special drivers (cached)
 if "special_drivers" not in st.session_state:
     st.session_state.special_drivers = None
 
 if st.session_state.special_drivers is None:
     st.markdown("### Special Drivers CSV")
-    # Embedded template – works everywhere including Streamlit Cloud
+    st.info("**Zones column = starting zones only** (driver must begin in one of these zones, but can go anywhere after).")
+
     template_csv = """km,Driver,Time Start,Zones
 60,970,14:30,"132, 134, 130, 112, 110"
 60,1292,15:00,"17, 19, 21, 7, 5, 15, 13, 11, 4"
@@ -400,7 +389,6 @@ if st.session_state.special_drivers is None:
 80,A224,12:00 PM,"131, 133, 113, 115, 111, 130, 110, 73, 71, 55, 53"
 """
 
-    st.info("Download the template, fill it, then upload your version.")
     st.download_button(
         label="📥 Download Special Drivers Template CSV",
         data=template_csv,
@@ -421,10 +409,8 @@ else:
         st.session_state.special_drivers = None
         st.rerun()
 
-# Trips file
 trips_file = st.file_uploader("Upload today's trips CSV", type="csv")
 
-# Build button
 if st.button("Build Schedules", type="primary"):
     if not trips_file:
         st.warning("Please upload the trips CSV.")
@@ -444,7 +430,7 @@ if st.button("Build Schedules", type="primary"):
             summary_df = build_summary(trips, schedules)
             details_df = build_details(trips, schedules, st.session_state.neighbors, snow_mode)
 
-        st.success(f"Done! Generated {len(schedules)} schedules ({len([s for s in schedules if s['is_special']])} special)")
+        st.success(f"Done! Generated {len(schedules)} schedules")
 
         st.subheader("Schedule Summary")
         st.dataframe(summary_df, use_container_width=True)
@@ -468,4 +454,4 @@ if st.button("Build Schedules", type="primary"):
         with st.expander("View Full Details Table"):
             st.dataframe(details_df, use_container_width=True)
 
-st.caption("Toronto Dispatch • Winter 2025 • Built with care for SCC")
+st.caption("Toronto Dispatch • Winter 2025 • Special drivers start in home zones, then free to roam")
