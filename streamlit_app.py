@@ -375,7 +375,7 @@ if "special_drivers" not in st.session_state:
 
 if st.session_state.special_drivers is None:
     st.markdown("### Special Drivers CSV")
-    st.info("**Zones column = starting zones only** (driver must begin in one of these zones, but can go anywhere after).")
+    st.info("**Zones column = starting zones only** (can go anywhere).")
 
     template_csv = """km,Driver,Time Start,Zones
 60,970,14:30,"132, 134, 130, 112, 110"
@@ -454,4 +454,4 @@ if st.button("Build Schedules", type="primary"):
         with st.expander("View Full Details Table"):
             st.dataframe(details_df, use_container_width=True)
 
-st.caption("Toronto Dispatch • Winter 2025 • Special drivers start in home zones, then free to roam")
+st.caption("Toronto Dispatch • Winter 2025 • Built with care for SCC")
